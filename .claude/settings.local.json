@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(elixir:*)",
+      "Bash(kill:*)",
+      "Bash(git remote:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}
