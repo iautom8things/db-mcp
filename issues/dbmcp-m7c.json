@@ -1,0 +1,14 @@
+{
+  "assignee": "",
+  "blocked_by": [],
+  "blocks": [],
+  "created": "2026-05-10T11:20:19Z",
+  "description": "Add an OrphanWatchdog to the entry point so the BEAM exits if the host crashes or leaks the stdin pipe FD.\n\n**Why:** MCP stdio servers normally exit when the host closes stdin (EOF). If the host crashes or leaks the pipe FD, EOF never arrives and the server zombies on `IO.read/2`, holding ports/sockets/PTYs open until manually killed.\n\n**Pattern (canonical):** see `AtlasMCP.OrphanWatchdog` in `/Users/mz/dev/mz/atlas/mcp/server.exs` and `SlackMcp.OrphanWatchdog` in `/Users/mz/dev/mz/slack-mcp/server.exs`. Spawns a background process that polls `ps -o ppid= -p \u003cself\u003e` every 5s and `System.halt(0)`s if reparented (PID 1 / launchd, or anything other than the boot-time parent).\n\n**How to apply:**\n1. Copy the OrphanWatchdog module verbatim, adjusting the namespace + Log reference.\n2. In the entry point, after Process.flag(:trap_exit, true) but before/around other startup work, capture initial PPID via OrphanWatchdog.current_ppid() and start the watchdog if non-nil. Match atlas/slack-mcp wording for the log lines.\n\n**Acceptance:**\n- Module exists, mirrors the atlas template.\n- Entry point starts the watchdog and logs \"Orphan watchdog armed (parent PID N)\" on success or \"Could not determine parent PID; orphan watchdog disabled\" on failure.\n- Existing tests still pass.",
+  "id": "dbmcp-m7c",
+  "labels": [],
+  "priority": 2,
+  "status": "open",
+  "title": "Add OrphanWatchdog (mirror atlas/slack-mcp)",
+  "type": "task",
+  "updated_at": "2026-05-10T11:20:19Z"
+}
