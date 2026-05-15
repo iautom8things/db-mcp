@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    env:
+      MIX_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Erlang and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Mix and Hex
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hex
+            ~/.mix
+            ~/.cache/mix
+          key: ${{ runner.os }}-mix-install-${{ hashFiles('server.exs', 'test.exs', 'Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-install-
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run checks
+        run: |
+          if make -qp 2>/dev/null | grep -E '^check:' >/dev/null; then
+            make check
+          else
+            make test.integration
+          fi

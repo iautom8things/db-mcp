@@ -1,12 +1,51 @@
 # db-mcp
 
-A self-contained MCP server for PostgreSQL database access via stdio, with credential management through 1Password.
+[![CI](https://github.com/<owner>/db-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/db-mcp/actions/workflows/ci.yml)
+
+A self-contained MCP server that gives Claude (or any MCP client) read/write access to PostgreSQL databases over stdio, with credentials sourced from 1Password and a browser-based approval flow for any non-read query. Reach for it when you want an AI assistant to *safely* explore a real database — read queries run in a `READ ONLY` transaction, writes require an explicit human click in a local web UI before they execute, and an interactive `psql` terminal is mounted in the browser so you can watch what is happening and run ad-hoc SQL alongside the agent.
+
+If you just need a query tool without guardrails, use `psql` directly; if you need a generic MCP shim, use a thinner alternative. `db-mcp` is opinionated specifically about *AI-driven* database work.
 
 ## Requirements
 
 - Elixir 1.18+ (uses built-in `JSON` module)
-- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for credential lookup
+- Python 3 — required at runtime by `pg_connect` / `pg_connect_local`. `server.exs` spawns `pty_bridge.py` as a port executable to host an interactive `psql` PTY for the optional web terminal. Missing Python will surface as a silently broken `pg_connect` flow.
+- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for credential lookup — only required for `pg_connect`. `pg_connect_local` does not call `op`.
 - Docker (for database tests only)
+
+## Quickstart
+
+The fastest path from zero to a query running against a local Postgres, with no 1Password required:
+
+```bash
+git clone https://github.com/autom8things/db-mcp "$HOME/db-mcp" && cd "$HOME/db-mcp"
+make install                                       # warm Mix.install deps so first boot is fast
+elixir server.exs                                  # boots the MCP server; logs Web UI URL to stderr
+# In your MCP client (e.g. Claude Code), point "db" at "$HOME/db-mcp/server.exs" (see Usage below),
+# then call pg_connect_local { "port": 5432, "username": "postgres", "password": "postgres", "database": "postgres" }
+```
+
+After `pg_connect_local` returns, you can run `pg_query { "sql": "SELECT now()" }` from the same MCP client and watch the same session in the browser psql terminal at the Web UI URL printed on stderr. No `op` biometric prompt, no 1Password vault setup — just a localhost Postgres of your choosing.
+
+## Development
+
+Three commands to go from a fresh clone to an iterating contributor:
+
+```bash
+git clone https://github.com/autom8things/db-mcp "$HOME/db-mcp" && cd "$HOME/db-mcp"
+make install                                       # warm Mix.install deps (~30s once, cached after)
+make test.unit                                     # fast unit suite — no Docker, no Postgres, no network
+```
+
+From there:
+
+- `make run` — start `server.exs` in the foreground for a manual smoke test against a real MCP client.
+- `make check` — composite target (format-check + lint + unit tests) suitable for pre-commit and CI.
+- `make test.integration` — adds the stdio-handshake integration suite (no Docker).
+- `make test.database` — spins a throwaway Docker Postgres and exercises the full read/write/approval flow.
+- `make clean` — clears the warm `Mix.install` cache when deps change.
+
+If you don't have Elixir 1.18+ installed yet, the two common paths are `asdf install elixir 1.18.0` (with the asdf-elixir plugin) or `brew install elixir` on macOS.
 
 ## Usage
 
@@ -23,23 +62,121 @@ Add to your MCP client configuration (e.g. Claude Code `~/.claude/settings.json`
 }
 ```
 
-The server exposes 6 tools over MCP:
+The server exposes 8 tools over MCP:
 
 | Tool | Description |
 |------|-------------|
-| `pg_connect` | Connect to a database using 1Password vault credentials |
+| `pg_connect` | Connect to a database using credentials from a 1Password item |
+| `pg_connect_local` | Connect to a localhost database with explicit credentials (no 1Password) |
 | `pg_disconnect` | Close a connection (or all connections) |
 | `pg_status` | Show connection info (host, database, user, version, pool health) |
 | `pg_query` | Execute a read-only SQL query (table/json/csv output) |
-| `pg_submit_write` | Submit a write query for two-step confirmation |
-| `pg_execute_write` | Execute a previously submitted write query by ID |
+| `pg_submit_write` | Submit a write query; blocks until the user approves or rejects in the web UI, then executes |
+| `session_history` | Read recent output from the browser psql terminal scrollback |
+| `search_history` | Search the browser psql terminal scrollback for a term |
 
 ### Connection flow
 
 1. `pg_connect` prompts for 1Password biometric once, then the connection persists for the session
 2. Multiple simultaneous named connections are supported (e.g. `prod`, `staging`)
 3. Read queries run in a `READ ONLY` transaction
-4. Write queries require explicit two-step confirmation: submit, then execute
+4. Write queries require explicit two-step confirmation: submit, then human approval in the browser
+
+## Configuration
+
+### Server environment variables
+
+All three are optional; defaults preserve the out-of-the-box behavior.
+
+| Variable             | Purpose                                          | Default                                                  | Example                                  |
+|----------------------|--------------------------------------------------|----------------------------------------------------------|------------------------------------------|
+| `DB_MCP_WEB_PORT`    | Pin the web approval UI to a fixed TCP port      | random free port (OS-assigned on each boot)              | `DB_MCP_WEB_PORT=54321`                  |
+| `DB_MCP_OP_BIN`      | Path to the 1Password CLI used by `pg_connect`   | `op` (resolved via `PATH`)                               | `DB_MCP_OP_BIN=/opt/homebrew/bin/op`     |
+| `DB_MCP_OP_ACCOUNT`  | 1Password account passed to `op item get`        | `team-chapterspot`                                       | `DB_MCP_OP_ACCOUNT=my-team`              |
+| `DB_MCP_PYTHON_BIN`  | Path to the `python3` interpreter for the PTY bridge | `System.find_executable("python3")` (resolved via `PATH`) | `DB_MCP_PYTHON_BIN=/Users/me/.venv/bin/python3` |
+
+Set them in your MCP client config (e.g. Claude Code `~/.claude/settings.json`) under the server's `env` block, or export them in the parent shell. An invalid `DB_MCP_WEB_PORT` value (non-integer or out of range) falls back to random allocation with a warning on stderr.
+
+### 1Password item schema (for `pg_connect`)
+
+`pg_connect` looks up a 1Password item by `vault_id` and `item_name` via the `op` CLI and reads the database credentials from its fields. The lookup passes `--account team-chapterspot` by default; set `DB_MCP_OP_ACCOUNT` if this server is running against a different signed-in 1Password account. Field labels are matched case-insensitively, and several common label variants are accepted (see `server.exs:39-50`):
+
+| Connection setting | Accepted field labels      | Required | Default |
+|--------------------|----------------------------|----------|---------|
+| Host               | `host`, `hostname`, `server` | yes      | —       |
+| Port               | `port`                     | no       | `5432`  |
+| Username           | `username`, `user`         | yes      | —       |
+| Password           | `password`                 | yes      | —       |
+| Database           | `database`, `dbname`, `db` | yes      | —       |
+
+Example 1Password item (Database type works well, but any item type with these field labels will do):
+
+```
+Title:    prod-readonly
+Vault:    Engineering
+Fields:
+  host       db.prod.internal.example.com
+  port       5432
+  username   readonly_app
+  password   ••••••••••••••
+  database   app_production
+```
+
+Then from an MCP client:
+
+```jsonc
+// tool: pg_connect
+{
+  "vault_id": "abcd1234efgh5678",       // 1Password vault ID, not name
+  "item_name": "prod-readonly",
+  "name": "prod"                          // optional; defaults to the database name
+}
+```
+
+To find a vault ID: `op vault list`.
+
+### Local dev databases (no 1Password)
+
+For local-only databases where 1Password is overkill, use `pg_connect_local`. The host is hard-coded to `localhost`, so this path cannot reach remote hosts:
+
+```jsonc
+// tool: pg_connect_local
+{
+  "port": 5432,
+  "username": "postgres",
+  "password": "postgres",
+  "database": "myapp_dev",
+  "name": "dev"                           // optional; defaults to the database name
+}
+```
+
+Use this for Docker Compose-managed dev databases, `make db.up` style local setups, or one-off scratch databases. For any remote database, use `pg_connect` with a 1Password item instead.
+
+## Web approval UI
+
+On startup, `server.exs` allocates a random free TCP port (by listening on port `0` and capturing the OS-assigned port — see `server.exs:2059-2063`) and starts a Bandit HTTP server on it. Two different sessions of `db-mcp` therefore won't collide. The chosen URL is logged to stderr on boot:
+
+```
+[INFO] Starting db-mcp v2.0.0
+[INFO] Web UI: http://localhost:54321
+```
+
+The same URL is also embedded in the responses from `pg_connect`, `pg_connect_local`, `pg_status`, and `pg_submit_write`, and is exposed in the MCP `initialize` response as `serverInfo.webUi`, so MCP clients can surface it directly to the user.
+
+What you see in the browser:
+
+- **Interactive psql terminal** — a real `psql` session running inside a PTY (via `pty_bridge.py`), mirrored over a WebSocket. You can run any SQL here directly; it doesn't go through the approval flow, because the human is already at the keyboard.
+- **Pending write approval banner** — when an MCP client calls `pg_submit_write`, a card appears with the SQL, an optional description, and the connection name. Buttons: **Approve** (runs the query and returns the result to the MCP client) or **Reject** (the query is never executed and the MCP client gets back a rejection message).
+- **Connection status** — host, database, user, port for the currently attached connection.
+
+### Why two-step writes?
+
+Read-only queries from an AI are low-stakes — at worst they're slow or noisy. Writes are different: a hallucinated `UPDATE` without a `WHERE` clause can wreck production. `db-mcp` splits the two by design:
+
+- `pg_query` is gated by a `READ ONLY` transaction at the database level, so even if the SQL validator misses something, PostgreSQL will refuse to mutate.
+- `pg_submit_write` is the only path to mutating SQL, and it *blocks* the MCP call until a human clicks Approve or Reject in the browser. There is no "auto-approve" mode, and there is no separate `pg_execute_write` tool the agent can call to bypass approval — submission and execution are fused inside a single approval-gated call.
+
+This is deliberate friction. The agent cannot "forget" to ask, and the human always sees the exact SQL that's about to run.
 
 ## Testing
 
@@ -48,9 +185,25 @@ The test harness is a single `test.exs` file with three progressive layers:
 ```bash
 make test              # All tests (unit + integration + database)
 make test.unit         # Unit tests only — no external dependencies
+make test.smoke        # Pre-push gate: unit + integration (no Docker)
 make test.integration  # Unit + integration — starts server as a Port child process
 make test.database     # Unit + database — requires Docker
 ```
+
+### Pre-push gate: `make test.smoke`
+
+`make test.smoke` is the recommended pre-push check. It runs the unit suite plus
+the integration layer, which:
+
+- Boots `server.exs` as a Port child and asserts `tools/list` returns the exact
+  set of 8 documented tool names (catches a regression that silently drops
+  `pg_connect_local` or `search_history`).
+- Spawns `python3 pty_bridge.py` and exchanges one framed init/started/exited
+  cycle for `command: "echo"` (catches a missing `pty_bridge.py` or a drift in
+  the length-prefixed binary frame protocol).
+
+Neither layer needs Docker or a running Postgres, so the smoke gate completes in
+seconds.
 
 Or run directly:
 
@@ -58,7 +211,7 @@ Or run directly:
 elixir test.exs                            # Unit tests only
 elixir test.exs --integration              # + integration tests
 elixir test.exs --database                 # + database tests
-elixir test.exs --integration --database   # All 79 tests
+elixir test.exs --integration --database   # Full suite
 ```
 
 ### Layer 1: Unit tests (always run)
@@ -68,7 +221,7 @@ Tests module internals with no external dependencies:
 - **DbMcp.SQL** — read-only validation, comment stripping, keyword blocking
 - **DbMcp.Format** — table/json/csv formatting, type decoding (nil, bool, Date, DateTime, Decimal, jsonb, list), row limits, cell truncation, response size cap, CSV escaping
 - **DbMcp.Credentials** — 1Password JSON parsing, field label variants, port defaults, validation
-- **DbMcp.Writes** — GenServer submit/fetch round-trip, one-time consumption, purge
+- **DbMcp.Approval** — blocking write-approval lifecycle, approval/rejection responses, concurrent submit guard
 
 ### Layer 2: Integration tests (`--integration`)
 
@@ -86,7 +239,7 @@ Spins up a throwaway Docker PostgreSQL, seeds test data, and bypasses 1Password 
 - **Connection Lifecycle** — status, status_all, list_connections
 - **Read Queries** — SELECT across all types (text, int, bool, date, jsonb, NULL), LIMIT, format options
 - **Read-Only Enforcement** — INSERT via pg_query fails gracefully (not crash)
-- **Write Flow** — submit, fetch, execute, verify with SELECT
+- **Write Flow** — pg_submit_write blocks for approval, executes on approval, verifies with SELECT
 - **jsonb Handling** — jsonb columns render as formatted JSON strings
 
 ## Architecture
@@ -96,8 +249,18 @@ The entire server is a single `server.exs` file — no Mix project. Modules defi
 - `DbMcp.Log` — stderr logging
 - `DbMcp.Credentials` — 1Password CLI integration and field parsing
 - `DbMcp.SQL` — read-only query validation
-- `DbMcp.Writes` — ETS-backed pending write queue with TTL
 - `DbMcp.Format` — query result formatting (table, json, csv)
 - `DbMcp.Connection` — GenServer managing named Postgrex connection pools
+- `DbMcp.Pty` — interactive psql PTY backed by `pty_bridge.py`
+- `DbMcp.Approval` — blocking write-approval coordinator
+- `DbMcp.Web` — Bandit/Plug HTTP server hosting the browser UI and approval API
 - `DbMcp.Tools` — MCP tool definitions and dispatch
 - `DbMcp.Server` — JSON-RPC 2.0 stdio loop and MCP protocol handling
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the release history. The project follows the [Keep a Changelog](https://keepachangelog.com/) format.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

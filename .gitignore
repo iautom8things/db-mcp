@@ -1,0 +1,18 @@
+# Elixir build / dependency artifacts
+_build/
+deps/
+*.beam
+*.ez
+erl_crash.dump
+
+# Editor / language server caches
+.elixir_ls/
+.lexical/
+.DS_Store
+
+# Local-only test fixtures and ephemeral state
+*.tmp
+*.log
+
+# NOTE: pty_bridge.py is part of the runtime (used by pg_connect) and must be
+# tracked. Do not add it here.
