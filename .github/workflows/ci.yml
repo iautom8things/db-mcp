@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.toolchain.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -16,6 +16,12 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+        toolchain:
+          # Primary: the exact toolchain we develop and ship on, read from
+          # .tool-versions so this file stays the single source of truth.
+          - { label: "tool-versions", from_file: true }
+          # Floor: the minimum the README advertises ("Elixir 1.18+").
+          - { label: "1.18-floor", otp: "27", elixir: "1.18", python: "3.12" }
 
     env:
       MIX_ENV: test
@@ -24,16 +30,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Erlang and Elixir
+      - name: Set up Erlang and Elixir (.tool-versions)
+        if: matrix.toolchain.from_file
         uses: erlef/setup-beam@v1
         with:
-          otp-version: "27"
-          elixir-version: "1.18"
+          version-file: .tool-versions
+          version-type: strict
 
-      - name: Set up Python
+      - name: Set up Erlang and Elixir (pinned)
+        if: ${{ !matrix.toolchain.from_file }}
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.toolchain.otp }}
+          elixir-version: ${{ matrix.toolchain.elixir }}
+
+      - name: Set up Python (.tool-versions)
+        if: matrix.toolchain.from_file
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version-file: .tool-versions
+
+      - name: Set up Python (pinned)
+        if: ${{ !matrix.toolchain.from_file }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.toolchain.python }}
 
       - name: Cache Mix and Hex
         uses: actions/cache@v4
@@ -42,9 +63,11 @@ jobs:
             ~/.hex
             ~/.mix
             ~/.cache/mix
-          key: ${{ runner.os }}-mix-install-${{ hashFiles('server.exs', 'test.exs', 'Makefile') }}
+          # Keyed on the resolved OTP/Elixir so the OTP 27 and OTP 28 BEAM
+          # artifacts never share a cache entry.
+          key: ${{ runner.os }}-${{ matrix.toolchain.label }}-mix-install-${{ hashFiles('.tool-versions', 'server.exs', 'test.exs', 'Makefile') }}
           restore-keys: |
-            ${{ runner.os }}-mix-install-
+            ${{ runner.os }}-${{ matrix.toolchain.label }}-mix-install-
 
       - name: Install dependencies
         run: make install

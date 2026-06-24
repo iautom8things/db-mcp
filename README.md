@@ -13,6 +13,8 @@ If you just need a query tool without guardrails, use `psql` directly; if you ne
 - [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for credential lookup — only required for `pg_connect`. `pg_connect_local` does not call `op`.
 - Docker (for database tests only)
 
+A [`.tool-versions`](.tool-versions) file pins the exact Erlang/Elixir/Python the project is developed and shipped on (Erlang 28, Elixir 1.19, Python 3.13). If you use [asdf](https://asdf-vm.com/) or [mise](https://mise.jdx.dev/), run `asdf install` (or `mise install`) in the repo root to match it. CI also tests the documented Elixir 1.18 floor, so older toolchains within the stated range remain supported.
+
 ## Quickstart
 
 The fastest path from zero to a query running against a local Postgres, with no 1Password required:
