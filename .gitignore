@@ -14,5 +14,8 @@ erl_crash.dump
 *.tmp
 *.log
 
+# Per-user Claude Code permissions — local only, not shared
+.claude/settings.local.json
+
 # NOTE: pty_bridge.py is part of the runtime (used by pg_connect) and must be
 # tracked. Do not add it here.
