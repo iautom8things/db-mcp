@@ -49,8 +49,6 @@ end
 defmodule DbMcp.Credentials do
   @moduledoc false
 
-  @default_op_account "team-chapterspot"
-
   @field_mappings %{
     "host" => :hostname,
     "hostname" => :hostname,
@@ -68,19 +66,11 @@ defmodule DbMcp.Credentials do
     DbMcp.Log.info("Fetching credentials from 1Password: vault=#{vault_id}, item=#{item_name}")
 
     op_bin = System.get_env("DB_MCP_OP_BIN") || "op"
-    op_account = op_account()
 
-    args = [
-      "item",
-      "get",
-      item_name,
-      "--account",
-      op_account,
-      "--vault",
-      vault_id,
-      "--format",
-      "json"
-    ]
+    args =
+      ["item", "get", item_name] ++
+        account_args() ++
+        ["--vault", vault_id, "--format", "json"]
 
     case System.cmd(op_bin, args, stderr_to_stdout: true) do
       {output, 0} ->
@@ -91,11 +81,13 @@ defmodule DbMcp.Credentials do
     end
   end
 
-  defp op_account do
+  # Only pass --account when DB_MCP_OP_ACCOUNT is set; otherwise let the `op`
+  # CLI use its currently signed-in account. There is no baked-in default.
+  defp account_args do
     case System.get_env("DB_MCP_OP_ACCOUNT") do
-      nil -> @default_op_account
-      "" -> @default_op_account
-      account -> account
+      nil -> []
+      "" -> []
+      account -> ["--account", account]
     end
   end
 
@@ -2149,7 +2141,7 @@ defmodule DbMcp.Server do
 
   @protocol_version "2025-11-25"
   @server_name "db-mcp"
-  @server_version "2.0.0"
+  @server_version "0.1.0"
 
   def run do
     DbMcp.Log.info("Starting #{@server_name} v#{@server_version}")

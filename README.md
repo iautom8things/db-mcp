@@ -1,6 +1,6 @@
 # db-mcp
 
-[![CI](https://github.com/<owner>/db-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/db-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/autom8things/db-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/autom8things/db-mcp/actions/workflows/ci.yml)
 
 A self-contained MCP server that gives Claude (or any MCP client) read/write access to PostgreSQL databases over stdio, with credentials sourced from 1Password and a browser-based approval flow for any non-read query. Reach for it when you want an AI assistant to *safely* explore a real database — read queries run in a `READ ONLY` transaction, writes require an explicit human click in a local web UI before they execute, and an interactive `psql` terminal is mounted in the browser so you can watch what is happening and run ad-hoc SQL alongside the agent.
 
@@ -86,20 +86,38 @@ The server exposes 8 tools over MCP:
 
 ### Server environment variables
 
-All three are optional; defaults preserve the out-of-the-box behavior.
+All are optional; defaults preserve the out-of-the-box behavior.
 
 | Variable             | Purpose                                          | Default                                                  | Example                                  |
 |----------------------|--------------------------------------------------|----------------------------------------------------------|------------------------------------------|
 | `DB_MCP_WEB_PORT`    | Pin the web approval UI to a fixed TCP port      | random free port (OS-assigned on each boot)              | `DB_MCP_WEB_PORT=54321`                  |
 | `DB_MCP_OP_BIN`      | Path to the 1Password CLI used by `pg_connect`   | `op` (resolved via `PATH`)                               | `DB_MCP_OP_BIN=/opt/homebrew/bin/op`     |
-| `DB_MCP_OP_ACCOUNT`  | 1Password account passed to `op item get`        | `team-chapterspot`                                       | `DB_MCP_OP_ACCOUNT=my-team`              |
+| `DB_MCP_OP_ACCOUNT`  | 1Password account passed to `op item get` as `--account`. When unset, `--account` is omitted and `op` uses its currently signed-in account | unset (use `op`'s default account)                       | `DB_MCP_OP_ACCOUNT=my-team`              |
 | `DB_MCP_PYTHON_BIN`  | Path to the `python3` interpreter for the PTY bridge | `System.find_executable("python3")` (resolved via `PATH`) | `DB_MCP_PYTHON_BIN=/Users/me/.venv/bin/python3` |
 
 Set them in your MCP client config (e.g. Claude Code `~/.claude/settings.json`) under the server's `env` block, or export them in the parent shell. An invalid `DB_MCP_WEB_PORT` value (non-integer or out of range) falls back to random allocation with a warning on stderr.
 
+If you have more than one 1Password account signed in, set `DB_MCP_OP_ACCOUNT` so `pg_connect` targets the right one. In a Claude Code MCP config that looks like:
+
+```json
+{
+  "mcpServers": {
+    "db": {
+      "command": "elixir",
+      "args": ["/path/to/db-mcp/server.exs"],
+      "env": {
+        "DB_MCP_OP_ACCOUNT": "my-team"
+      }
+    }
+  }
+}
+```
+
+Or in the parent shell: `export DB_MCP_OP_ACCOUNT=my-team`. Run `op account list` to see your signed-in account shorthands.
+
 ### 1Password item schema (for `pg_connect`)
 
-`pg_connect` looks up a 1Password item by `vault_id` and `item_name` via the `op` CLI and reads the database credentials from its fields. The lookup passes `--account team-chapterspot` by default; set `DB_MCP_OP_ACCOUNT` if this server is running against a different signed-in 1Password account. Field labels are matched case-insensitively, and several common label variants are accepted (see `server.exs:39-50`):
+`pg_connect` looks up a 1Password item by `vault_id` and `item_name` via the `op` CLI and reads the database credentials from its fields. By default no `--account` flag is passed, so `op` uses its currently signed-in account; set `DB_MCP_OP_ACCOUNT` to target a specific account (see [Server environment variables](#server-environment-variables) above). Field labels are matched case-insensitively, and several common label variants are accepted (see `server.exs:39-50`):
 
 | Connection setting | Accepted field labels      | Required | Default |
 |--------------------|----------------------------|----------|---------|
@@ -157,7 +175,7 @@ Use this for Docker Compose-managed dev databases, `make db.up` style local setu
 On startup, `server.exs` allocates a random free TCP port (by listening on port `0` and capturing the OS-assigned port — see `server.exs:2059-2063`) and starts a Bandit HTTP server on it. Two different sessions of `db-mcp` therefore won't collide. The chosen URL is logged to stderr on boot:
 
 ```
-[INFO] Starting db-mcp v2.0.0
+[INFO] Starting db-mcp v0.1.0
 [INFO] Web UI: http://localhost:54321
 ```
 

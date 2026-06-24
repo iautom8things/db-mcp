@@ -593,7 +593,7 @@ creds_results =
        {:ok, creds} = DbMcp.Credentials.parse_item(json)
        TestRunner.assert_eq!(creds.hostname, "first.example.com")
      end},
-    {"fetch passes default 1Password account to op",
+    {"fetch omits --account when DB_MCP_OP_ACCOUNT is unset",
      fn ->
        json =
          JSON.encode!(%{
@@ -611,7 +611,7 @@ creds_results =
 
        File.write!(op_path, """
        #!/bin/sh
-       expected='item get item123 --account team-chapterspot --vault vault123 --format json'
+       expected='item get item123 --vault vault123 --format json'
        if [ "$*" != "$expected" ]; then
          echo "bad args: $*" >&2
          exit 99
@@ -691,7 +691,7 @@ creds_results =
 
        File.write!(op_path, """
        #!/bin/sh
-       echo 'account team-chapterspot is not signed in' >&2
+       echo 'no account is signed in' >&2
        exit 1
        """)
 
@@ -705,7 +705,7 @@ creds_results =
          System.delete_env("DB_MCP_OP_ACCOUNT")
 
          {:error, msg} = DbMcp.Credentials.fetch("vault123", "item123")
-         TestRunner.assert_match!(msg, "account team-chapterspot is not signed in")
+         TestRunner.assert_match!(msg, "no account is signed in")
        after
          TestRunner.restore_env("DB_MCP_OP_BIN", old_bin)
          TestRunner.restore_env("DB_MCP_OP_ACCOUNT", old_account)
