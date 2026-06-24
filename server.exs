@@ -1475,8 +1475,10 @@ defmodule DbMcp.Connection do
             {:reply, {:ok, "[#{name}] #{formatted}\n\nExecution time: #{elapsed}ms"}, state}
 
           {:error, reason} ->
-            {:reply, {:error, humanize_query_error(name, reason, meta) |> String.replace("Query failed", "Execution failed")},
-             state}
+            {:reply,
+             {:error,
+              humanize_query_error(name, reason, meta)
+              |> String.replace("Query failed", "Execution failed")}, state}
         end
     end
   end
@@ -1490,8 +1492,7 @@ defmodule DbMcp.Connection do
         new_conns = Map.delete(conns, name)
         DbMcp.Log.error("TCP probe failed for '#{name}': #{inspect(reason)}")
 
-        {:reply, {:error, humanize_tcp_error(reason, ctx)},
-         %{state | connections: new_conns}}
+        {:reply, {:error, humanize_tcp_error(reason, ctx)}, %{state | connections: new_conns}}
     end
   end
 
@@ -1586,8 +1587,7 @@ defmodule DbMcp.Connection do
         new_conns = Map.delete(conns, name)
         DbMcp.Log.error("Pool start_link failed for '#{name}': #{inspect(reason)}")
 
-        {:reply, {:error, humanize_connect_error(reason, ctx)},
-         %{state | connections: new_conns}}
+        {:reply, {:error, humanize_connect_error(reason, ctx)}, %{state | connections: new_conns}}
     end
   end
 
@@ -1619,7 +1619,9 @@ defmodule DbMcp.Connection do
   # message that names the host/port/user/database the caller was reaching for.
   defp humanize_connect_error(reason, ctx) do
     %{host: host, port: port, user: user, database: db} = ctx
-    header = "Could not connect to PostgreSQL at #{host}:#{port} (database '#{db}', user '#{user}')."
+
+    header =
+      "Could not connect to PostgreSQL at #{host}:#{port} (database '#{db}', user '#{user}')."
 
     detail =
       case reason do
@@ -2307,7 +2309,9 @@ unless Code.ensure_loaded?(TestRunner) do
             p
 
           _ ->
-            DbMcp.Log.error("Invalid DB_MCP_WEB_PORT=#{inspect(val)}; falling back to random port")
+            DbMcp.Log.error(
+              "Invalid DB_MCP_WEB_PORT=#{inspect(val)}; falling back to random port"
+            )
 
             {:ok, socket} = :gen_tcp.listen(0, [])
             {:ok, p} = :inet.port(socket)
