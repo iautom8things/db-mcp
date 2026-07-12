@@ -687,6 +687,96 @@ creds_results =
          File.rm_rf(dir)
        end
      end},
+    {"fetch prefers explicit account argument over DB_MCP_OP_ACCOUNT",
+     fn ->
+       json =
+         JSON.encode!(%{
+           "fields" => [
+             %{"label" => "host", "value" => "db.example.com"},
+             %{"label" => "username", "value" => "admin"},
+             %{"label" => "password", "value" => "secret"},
+             %{"label" => "database", "value" => "mydb"}
+           ]
+         })
+
+       dir = Path.join(System.tmp_dir!(), "db_mcp_op_#{System.unique_integer([:positive])}")
+       op_path = Path.join(dir, "op")
+       File.mkdir_p!(dir)
+
+       File.write!(op_path, """
+       #!/bin/sh
+       expected='item get item123 --account arg-account --vault vault123 --format json'
+       if [ "$*" != "$expected" ]; then
+         echo "bad args: $*" >&2
+         exit 99
+       fi
+       cat <<'JSON'
+       #{json}
+       JSON
+       """)
+
+       File.chmod!(op_path, 0o755)
+
+       old_bin = System.get_env("DB_MCP_OP_BIN")
+       old_account = System.get_env("DB_MCP_OP_ACCOUNT")
+
+       try do
+         System.put_env("DB_MCP_OP_BIN", op_path)
+         System.put_env("DB_MCP_OP_ACCOUNT", "env-account")
+
+         {:ok, creds} = DbMcp.Credentials.fetch("vault123", "item123", "arg-account")
+         TestRunner.assert_eq!(creds.database, "mydb")
+       after
+         TestRunner.restore_env("DB_MCP_OP_BIN", old_bin)
+         TestRunner.restore_env("DB_MCP_OP_ACCOUNT", old_account)
+         File.rm_rf(dir)
+       end
+     end},
+    {"fetch falls back to DB_MCP_OP_ACCOUNT when account argument is empty",
+     fn ->
+       json =
+         JSON.encode!(%{
+           "fields" => [
+             %{"label" => "host", "value" => "db.example.com"},
+             %{"label" => "username", "value" => "admin"},
+             %{"label" => "password", "value" => "secret"},
+             %{"label" => "database", "value" => "mydb"}
+           ]
+         })
+
+       dir = Path.join(System.tmp_dir!(), "db_mcp_op_#{System.unique_integer([:positive])}")
+       op_path = Path.join(dir, "op")
+       File.mkdir_p!(dir)
+
+       File.write!(op_path, """
+       #!/bin/sh
+       expected='item get item123 --account env-account --vault vault123 --format json'
+       if [ "$*" != "$expected" ]; then
+         echo "bad args: $*" >&2
+         exit 99
+       fi
+       cat <<'JSON'
+       #{json}
+       JSON
+       """)
+
+       File.chmod!(op_path, 0o755)
+
+       old_bin = System.get_env("DB_MCP_OP_BIN")
+       old_account = System.get_env("DB_MCP_OP_ACCOUNT")
+
+       try do
+         System.put_env("DB_MCP_OP_BIN", op_path)
+         System.put_env("DB_MCP_OP_ACCOUNT", "env-account")
+
+         {:ok, creds} = DbMcp.Credentials.fetch("vault123", "item123", "")
+         TestRunner.assert_eq!(creds.database, "mydb")
+       after
+         TestRunner.restore_env("DB_MCP_OP_BIN", old_bin)
+         TestRunner.restore_env("DB_MCP_OP_ACCOUNT", old_account)
+         File.rm_rf(dir)
+       end
+     end},
     {"fetch reports op stderr on lookup failure",
      fn ->
        dir = Path.join(System.tmp_dir!(), "db_mcp_op_#{System.unique_integer([:positive])}")

@@ -94,7 +94,7 @@ All are optional; defaults preserve the out-of-the-box behavior.
 |----------------------|--------------------------------------------------|----------------------------------------------------------|------------------------------------------|
 | `DB_MCP_WEB_PORT`    | Pin the web approval UI to a fixed TCP port      | random free port (OS-assigned on each boot)              | `DB_MCP_WEB_PORT=54321`                  |
 | `DB_MCP_OP_BIN`      | Path to the 1Password CLI used by `pg_connect`   | `op` (resolved via `PATH`)                               | `DB_MCP_OP_BIN=/opt/homebrew/bin/op`     |
-| `DB_MCP_OP_ACCOUNT`  | 1Password account passed to `op item get` as `--account`. When unset, `--account` is omitted and `op` uses its currently signed-in account | unset (use `op`'s default account)                       | `DB_MCP_OP_ACCOUNT=my-team`              |
+| `DB_MCP_OP_ACCOUNT`  | 1Password account passed to `op item get` as `--account`. Overridden per-call by the `account` parameter on `pg_connect`. When neither is set, `--account` is omitted and `op` uses its currently signed-in account | unset (use `op`'s default account)                       | `DB_MCP_OP_ACCOUNT=my-team`              |
 | `DB_MCP_PYTHON_BIN`  | Path to the `python3` interpreter for the PTY bridge | `System.find_executable("python3")` (resolved via `PATH`) | `DB_MCP_PYTHON_BIN=/Users/me/.venv/bin/python3` |
 | `DB_MCP_AUTO_OPEN`   | Set to `0`/`false`/`no` to stop the server from opening the web UI in a browser while a write approval is blocked waiting on a human | enabled | `DB_MCP_AUTO_OPEN=0`                     |
 
@@ -118,9 +118,17 @@ If you have more than one 1Password account signed in, set `DB_MCP_OP_ACCOUNT` s
 
 Or in the parent shell: `export DB_MCP_OP_ACCOUNT=my-team`. Run `op account list` to see your signed-in account shorthands.
 
+Agents can also pick the account per connection by passing `account` directly to `pg_connect` (shorthand, sign-in address, or account UUID — anything `op --account` accepts):
+
+```json
+{ "vault_id": "abc123", "item_name": "prod-readonly", "account": "my-team" }
+```
+
+The `account` parameter takes precedence over `DB_MCP_OP_ACCOUNT`; when both are absent, `op` uses its currently signed-in account.
+
 ### 1Password item schema (for `pg_connect`)
 
-`pg_connect` looks up a 1Password item by `vault_id` and `item_name` via the `op` CLI and reads the database credentials from its fields. By default no `--account` flag is passed, so `op` uses its currently signed-in account; set `DB_MCP_OP_ACCOUNT` to target a specific account (see [Server environment variables](#server-environment-variables) above). Field labels are matched case-insensitively, and several common label variants are accepted (see `server.exs:39-50`):
+`pg_connect` looks up a 1Password item by `vault_id` and `item_name` via the `op` CLI and reads the database credentials from its fields. By default no `--account` flag is passed, so `op` uses its currently signed-in account; pass the `account` parameter on `pg_connect` or set `DB_MCP_OP_ACCOUNT` to target a specific account (see [Server environment variables](#server-environment-variables) above). Field labels are matched case-insensitively, and several common label variants are accepted (see `server.exs:39-50`):
 
 | Connection setting | Accepted field labels      | Required | Default |
 |--------------------|----------------------------|----------|---------|

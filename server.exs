@@ -64,14 +64,14 @@ defmodule DbMcp.Credentials do
     "db" => :database
   }
 
-  def fetch(vault_id, item_name) do
+  def fetch(vault_id, item_name, account \\ nil) do
     DbMcp.Log.info("Fetching credentials from 1Password: vault=#{vault_id}, item=#{item_name}")
 
     op_bin = System.get_env("DB_MCP_OP_BIN") || "op"
 
     args =
       ["item", "get", item_name] ++
-        account_args() ++
+        account_args(account) ++
         ["--vault", vault_id, "--format", "json"]
 
     case System.cmd(op_bin, args, stderr_to_stdout: true) do
@@ -83,9 +83,14 @@ defmodule DbMcp.Credentials do
     end
   end
 
-  # Only pass --account when DB_MCP_OP_ACCOUNT is set; otherwise let the `op`
-  # CLI use its currently signed-in account. There is no baked-in default.
-  defp account_args do
+  # An explicit account argument takes precedence over DB_MCP_OP_ACCOUNT.
+  # When neither is set, --account is omitted and the `op` CLI uses its
+  # currently signed-in account. There is no baked-in default.
+  defp account_args(account) when is_binary(account) and account != "" do
+    ["--account", account]
+  end
+
+  defp account_args(_) do
     case System.get_env("DB_MCP_OP_ACCOUNT") do
       nil -> []
       "" -> []
@@ -1495,8 +1500,8 @@ defmodule DbMcp.Connection do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
-  def connect(vault_id, item_name, name) do
-    GenServer.call(__MODULE__, {:connect, vault_id, item_name, name}, 30_000)
+  def connect(vault_id, item_name, name, account \\ nil) do
+    GenServer.call(__MODULE__, {:connect, vault_id, item_name, name, account}, 30_000)
   end
 
   def connect_local(creds, name) do
@@ -1537,13 +1542,17 @@ defmodule DbMcp.Connection do
   end
 
   @impl GenServer
-  def handle_call({:connect, vault_id, item_name, name}, _from, %{connections: conns} = state) do
+  def handle_call(
+        {:connect, vault_id, item_name, name, account},
+        _from,
+        %{connections: conns} = state
+      ) do
     case Map.get(conns, name) do
       %{pool: old_pool} -> GenServer.stop(old_pool, :normal, 5_000)
       nil -> :ok
     end
 
-    case DbMcp.Credentials.fetch(vault_id, item_name) do
+    case DbMcp.Credentials.fetch(vault_id, item_name, account) do
       {:ok, creds} ->
         ctx = %{
           host: creds.hostname,
@@ -2041,6 +2050,14 @@ defmodule DbMcp.Tools do
               "description" =>
                 "A short name for this connection (e.g. 'prod', 'staging'). " <>
                   "Defaults to the database name from the credentials."
+            },
+            "account" => %{
+              "type" => "string",
+              "description" =>
+                "1Password account to use for the credential lookup (passed to `op` as --account; " <>
+                  "shorthand, sign-in address, or account UUID). Takes precedence over the " <>
+                  "DB_MCP_OP_ACCOUNT env var. When omitted, falls back to DB_MCP_OP_ACCOUNT, " <>
+                  "then to op's currently signed-in account."
             }
           }
         }
@@ -2214,13 +2231,14 @@ defmodule DbMcp.Tools do
 
   def call("pg_connect", %{"vault_id" => vault_id, "item_name" => item_name} = params) do
     explicit_name = Map.get(params, "name")
+    account = Map.get(params, "account")
 
     if explicit_name do
-      do_connect(vault_id, item_name, explicit_name)
+      do_connect(vault_id, item_name, explicit_name, account)
     else
-      case DbMcp.Credentials.fetch(vault_id, item_name) do
+      case DbMcp.Credentials.fetch(vault_id, item_name, account) do
         {:ok, creds} ->
-          do_connect(vault_id, item_name, creds.database)
+          do_connect(vault_id, item_name, creds.database, account)
 
         {:error, reason} ->
           tool_error(reason)
@@ -2415,8 +2433,8 @@ defmodule DbMcp.Tools do
     end
   end
 
-  defp do_connect(vault_id, item_name, name) do
-    case DbMcp.Connection.connect(vault_id, item_name, name) do
+  defp do_connect(vault_id, item_name, name, account) do
+    case DbMcp.Connection.connect(vault_id, item_name, name, account) do
       {:ok, msg} -> tool_result(msg)
       {:error, reason} -> tool_error(reason)
     end
