@@ -7,7 +7,9 @@
 #
 # Read queries (pg_query) execute instantly via Postgrex — no approval needed.
 # Write queries (pg_submit_write) block until the user approves them in the
-# web UI, then execute immediately on approval.
+# web UI, then execute immediately on approval. While an approval is pending
+# the browser is opened automatically (unless DB_MCP_AUTO_OPEN=0) and the web
+# UI re-alerts the user every minute with a notification + audio ding.
 #
 # A psql PTY session is started for each connection and exposed via xterm.js
 # in the browser, so the user can also interact with the database directly.
@@ -384,6 +386,7 @@ defmodule DbMcp.Pty do
   def unsubscribe(pid), do: GenServer.cast(__MODULE__, {:unsubscribe, pid})
   def get_scrollback(n \\ 100), do: GenServer.call(__MODULE__, {:get_scrollback, n})
   def search_scrollback(query), do: GenServer.call(__MODULE__, {:search_scrollback, query})
+  def subscriber_count, do: GenServer.call(__MODULE__, :subscriber_count)
 
   @impl GenServer
   def init(state), do: {:ok, state}
@@ -397,6 +400,11 @@ defmodule DbMcp.Pty do
     }
 
     {:reply, info, state}
+  end
+
+  @impl GenServer
+  def handle_call(:subscriber_count, _from, state) do
+    {:reply, MapSet.size(state.subscribers), state}
   end
 
   @impl GenServer
@@ -591,6 +599,59 @@ defmodule DbMcp.Pty do
   defp strip_ansi(text), do: Regex.replace(~r/\x1b\[[0-9;]*[a-zA-Z]/, text, "")
 end
 
+defmodule DbMcp.Browser do
+  @moduledoc """
+  Opens the web UI in the user's browser when an approval is blocked waiting
+  for a human and no browser tab is currently connected.
+
+  Disable with DB_MCP_AUTO_OPEN=0 (also honors "false"/"no").
+  """
+
+  def auto_open_enabled? do
+    System.get_env("DB_MCP_AUTO_OPEN", "1") not in ["0", "false", "no"]
+  end
+
+  @doc """
+  Open `url` unless auto-open is disabled or a web UI client is already
+  connected (an open tab gets alerted via browser notification instead).
+  """
+  def maybe_open(url) do
+    if auto_open_enabled?() and ui_client_count() == 0 do
+      open(url)
+    else
+      :ok
+    end
+  end
+
+  defp ui_client_count do
+    if Process.whereis(DbMcp.Pty), do: DbMcp.Pty.subscriber_count(), else: 0
+  end
+
+  defp open(url) do
+    opener =
+      case :os.type() do
+        {:unix, :darwin} -> "open"
+        _ -> "xdg-open"
+      end
+
+    DbMcp.Log.info("Opening browser: #{opener} #{url}")
+
+    # Fire-and-forget: a missing opener or a failed launch must never take
+    # down the approval flow.
+    Task.start(fn ->
+      try do
+        System.cmd(opener, [url], stderr_to_stdout: true)
+      rescue
+        _ -> :ok
+      catch
+        _, _ -> :ok
+      end
+    end)
+
+    :ok
+  end
+end
+
 defmodule DbMcp.Activity do
   @moduledoc """
   Tracks MCP tool calls (pg_query, pg_submit_write) and broadcasts them
@@ -608,8 +669,8 @@ defmodule DbMcp.Activity do
   def unsubscribe(pid), do: GenServer.cast(__MODULE__, {:unsubscribe, pid})
   def recent(n \\ 50), do: GenServer.call(__MODULE__, {:recent, n})
 
-  def push(tool, sql, result, status) do
-    GenServer.cast(__MODULE__, {:push, tool, sql, result, status})
+  def push(tool, sql, result, status, context \\ %{}) do
+    GenServer.cast(__MODULE__, {:push, tool, sql, result, status, context})
   end
 
   @impl GenServer
@@ -627,12 +688,14 @@ defmodule DbMcp.Activity do
   end
 
   @impl GenServer
-  def handle_cast({:push, tool, sql, result, status}, state) do
+  def handle_cast({:push, tool, sql, result, status, context}, state) do
     event = %{
       tool: tool,
       sql: sql,
       result: result,
       status: status,
+      description: Map.get(context, :description, ""),
+      reason: Map.get(context, :reason, ""),
       at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
@@ -664,20 +727,42 @@ defmodule DbMcp.Approval do
   pg_submit_write calls submit_and_wait/3, which blocks the caller until the
   user approves or rejects the query in the browser. On approval the caller
   proceeds to execute; on rejection it returns immediately without executing.
+
+  While an approval is pending the browser is opened automatically (and
+  re-opened every minute if no web UI client is connected) so the human
+  actually sees the blocked agent. See DbMcp.Browser.
   """
 
   use GenServer
+
+  @alert_interval_ms 60_000
 
   defstruct pending: nil
 
   def start_link, do: GenServer.start_link(__MODULE__, %__MODULE__{}, name: __MODULE__)
   def get_pending, do: GenServer.call(__MODULE__, :get_pending)
 
-  def submit_and_wait(sql, description, connection_name) do
+  @doc """
+  Block until the user decides. `context` is either a plain description
+  string or a map with :description (what), :reason (why), and :impact
+  (expected effect / reversibility) — all shown in the approval UI.
+  """
+  def submit_and_wait(sql, context, connection_name) do
     GenServer.call(
       __MODULE__,
-      {:submit, sql, description, connection_name},
+      {:submit, sql, normalize_context(context), connection_name},
       to_timeout(minute: 30)
+    )
+  end
+
+  defp normalize_context(description) when is_binary(description) do
+    %{description: description, reason: "", impact: ""}
+  end
+
+  defp normalize_context(%{} = context) do
+    Map.merge(
+      %{description: "", reason: "", impact: ""},
+      Map.take(context, [:description, :reason, :impact])
     )
   end
 
@@ -692,24 +777,26 @@ defmodule DbMcp.Approval do
   def handle_call(:get_pending, _from, state), do: {:reply, state.pending, state}
 
   @impl GenServer
-  def handle_call({:submit, sql, description, connection_name}, from, state) do
+  def handle_call({:submit, sql, context, connection_name}, from, state) do
     if state.pending do
       {:reply, {:error, "Another approval is already pending"}, state}
     else
       id = :crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower)
 
-      pending = %{
-        id: id,
-        sql: sql,
-        description: description,
-        connection_name: connection_name,
-        from: from,
-        submitted_at: DateTime.utc_now() |> DateTime.to_iso8601()
-      }
+      pending =
+        Map.merge(context, %{
+          id: id,
+          sql: sql,
+          connection_name: connection_name,
+          from: from,
+          submitted_at: DateTime.utc_now() |> DateTime.to_iso8601()
+        })
 
       DbMcp.Log.info(
         "Write approval pending: #{id} — review at http://localhost:#{DbMcp.Server.web_port()}"
       )
+
+      send(self(), {:alert_tick, id})
 
       {:noreply, %{state | pending: pending}}
     end
@@ -728,6 +815,25 @@ defmodule DbMcp.Approval do
         {:noreply, state}
     end
   end
+
+  # Fires immediately on submit, then every minute while the same approval is
+  # still pending. Opens the browser when no web UI tab is connected; an open
+  # tab handles its own re-alerting (notification + ding) client-side.
+  @impl GenServer
+  def handle_info({:alert_tick, id}, state) do
+    case state.pending do
+      %{id: ^id} ->
+        DbMcp.Browser.maybe_open("http://localhost:#{DbMcp.Server.web_port()}")
+        Process.send_after(self(), {:alert_tick, id}, @alert_interval_ms)
+        {:noreply, state}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_info(_msg, state), do: {:noreply, state}
 end
 
 defmodule DbMcp.WsHandler do
@@ -836,6 +942,8 @@ defmodule DbMcp.Web do
             id: pending.id,
             sql: pending.sql,
             description: pending.description,
+            reason: pending.reason,
+            impact: pending.impact,
             connection: pending.connection_name,
             submitted_at: pending.submitted_at
           }
@@ -878,9 +986,12 @@ defmodule DbMcp.Web do
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>DB</title>
       <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css">
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/styles/github-dark.min.css">
       <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.js"></script>
       <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10/lib/addon-fit.js"></script>
       <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11/lib/addon-web-links.js"></script>
+      <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11/highlight.min.js"></script>
+      <script src="https://cdn.jsdelivr.net/npm/sql-formatter@15/dist/sql-formatter.min.js"></script>
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         html, body { height: 100%; overflow: hidden; }
@@ -924,18 +1035,29 @@ defmodule DbMcp.Web do
           color: #fab387; font-size: 11px; text-transform: uppercase;
           letter-spacing: 1px; margin-bottom: 6px;
         }
-        #approval .description {
-          color: #6c7086; font-style: italic; margin-bottom: 8px; font-size: 12px;
-        }
         #approval .conn-tag {
           color: #cba6f7; font-size: 11px; margin-bottom: 6px;
         }
+        #approval .ctx {
+          display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px;
+        }
+        .ctx-row { display: flex; gap: 10px; font-size: 12px; align-items: baseline; }
+        .ctx-label {
+          color: #6c7086; font-size: 10px; text-transform: uppercase;
+          letter-spacing: 0.5px; min-width: 52px; flex-shrink: 0;
+        }
+        .ctx-value { color: #cdd6f4; }
         #approval .sql {
-          background: #11111b; color: #f9e2af; padding: 8px 12px;
+          background: #11111b; padding: 8px 12px;
           border-radius: 4px; margin-bottom: 10px;
           white-space: pre-wrap; word-break: break-word;
-          max-height: 200px; overflow-y: auto; font-size: 13px;
-          border: 1px solid #fab387;
+          max-height: 260px; overflow-y: auto; font-size: 13px;
+          border: 1px solid #fab387; font-family: inherit;
+        }
+        .sql code.hljs, .activity-sql code.hljs {
+          background: transparent; padding: 0; display: block;
+          white-space: pre-wrap; word-break: break-word;
+          font-family: inherit; font-size: inherit;
         }
         .btn-row { display: flex; gap: 10px; }
         .btn {
@@ -984,6 +1106,9 @@ defmodule DbMcp.Web do
           background: #313244; color: #89b4fa;
         }
         .activity-time { font-size: 10px; color: #585b70; }
+        .activity-desc {
+          color: #a6adc8; font-style: italic; font-size: 11px; margin-bottom: 6px;
+        }
         .activity-sql {
           background: #11111b; padding: 6px 8px; border-radius: 4px;
           font-size: 11px; color: #cdd6f4; white-space: pre-wrap;
@@ -1006,8 +1131,12 @@ defmodule DbMcp.Web do
       <div id="approval">
         <div class="label">Write Query — Pending Approval</div>
         <div id="approval-conn" class="conn-tag"></div>
-        <div id="approval-desc" class="description"></div>
-        <div id="approval-sql" class="sql"></div>
+        <div class="ctx">
+          <div class="ctx-row" id="approval-desc-row"><span class="ctx-label">What</span><span class="ctx-value" id="approval-desc"></span></div>
+          <div class="ctx-row" id="approval-reason-row"><span class="ctx-label">Why</span><span class="ctx-value" id="approval-reason"></span></div>
+          <div class="ctx-row" id="approval-impact-row"><span class="ctx-label">Impact</span><span class="ctx-value" id="approval-impact"></span></div>
+        </div>
+        <pre id="approval-sql" class="sql"></pre>
         <div class="btn-row">
           <button class="btn btn-approve" id="btn-approve">Execute</button>
           <button class="btn btn-reject" id="btn-reject">Reject</button>
@@ -1113,6 +1242,24 @@ defmodule DbMcp.Web do
 
         connectWs();
 
+        // --- SQL pretty-printing + syntax highlighting ---
+        function formatSql(sql) {
+          try {
+            return sqlFormatter.format(sql, { language: 'postgresql', keywordCase: 'upper' });
+          } catch (e) {
+            return sql;
+          }
+        }
+
+        function renderSql(el, sql) {
+          el.textContent = '';
+          const code = document.createElement('code');
+          code.className = 'language-sql';
+          code.textContent = formatSql(sql);
+          el.appendChild(code);
+          try { hljs.highlightElement(code); } catch (e) {}
+        }
+
         // --- Activity pane ---
         const activityLog = document.getElementById('activity-log');
 
@@ -1124,14 +1271,30 @@ defmodule DbMcp.Web do
           const sql = ev.sql.length > 500 ? ev.sql.slice(0, 500) + '...' : ev.sql;
           const result = (ev.result || '').length > 2000 ? ev.result.slice(0, 2000) + '...' : (ev.result || '');
 
-          el.innerHTML = `
-            <div class="activity-meta">
-              <span class="activity-tool">${ev.tool}</span>
-              <span class="activity-time">${time}</span>
-            </div>
-            <div class="activity-sql">${escapeHtml(sql)}</div>
-            <div class="activity-result">${escapeHtml(result)}</div>
+          const meta = document.createElement('div');
+          meta.className = 'activity-meta';
+          meta.innerHTML = `
+            <span class="activity-tool">${escapeHtml(ev.tool)}</span>
+            <span class="activity-time">${escapeHtml(time)}</span>
           `;
+          el.appendChild(meta);
+
+          if (ev.description) {
+            const desc = document.createElement('div');
+            desc.className = 'activity-desc';
+            desc.textContent = ev.description + (ev.reason ? ` — ${ev.reason}` : '');
+            el.appendChild(desc);
+          }
+
+          const sqlEl = document.createElement('pre');
+          sqlEl.className = 'activity-sql';
+          renderSql(sqlEl, sql);
+          el.appendChild(sqlEl);
+
+          const resultEl = document.createElement('div');
+          resultEl.className = 'activity-result';
+          resultEl.textContent = result;
+          el.appendChild(resultEl);
 
           activityLog.appendChild(el);
           activityLog.scrollTop = activityLog.scrollHeight;
@@ -1143,8 +1306,91 @@ defmodule DbMcp.Web do
           return div.innerHTML;
         }
 
+        // --- Approval alerting: notification + ding, re-alerted every minute ---
+        const ALERT_INTERVAL_MS = 60000;
+        const baseTitle = document.title;
+        let audioCtx = null;
+        let titleFlashTimer = null;
+
+        function ensureAudio() {
+          if (!audioCtx) {
+            try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+          }
+          if (audioCtx && audioCtx.state === 'suspended') {
+            audioCtx.resume().catch(() => {});
+          }
+          return audioCtx;
+        }
+
+        function ding() {
+          const ctx = ensureAudio();
+          if (!ctx || ctx.state !== 'running') return;
+          const now = ctx.currentTime;
+          [[880, 0], [1318.5, 0.15]].forEach(([freq, delay]) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.0001, now + delay);
+            gain.gain.exponentialRampToValueAtTime(0.25, now + delay + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.6);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now + delay);
+            osc.stop(now + delay + 0.65);
+          });
+        }
+
+        function requestNotifyPermission() {
+          if ('Notification' in window && Notification.permission === 'default') {
+            try { Notification.requestPermission(); } catch (e) {}
+          }
+        }
+
+        function notifyApproval(pending) {
+          if (!('Notification' in window) || Notification.permission !== 'granted') return;
+          try {
+            const sqlExcerpt = pending.sql.length > 120 ? pending.sql.slice(0, 120) + '...' : pending.sql;
+            const body = [pending.description, pending.reason, `[${pending.connection}] ${sqlExcerpt}`]
+              .filter(Boolean).join('\n');
+            const n = new Notification('DB write approval needed', {
+              body, tag: 'db-mcp-approval', renotify: true, requireInteraction: true
+            });
+            n.onclick = () => { window.focus(); n.close(); };
+          } catch (e) {}
+        }
+
+        function alertPending(pending) {
+          notifyApproval(pending);
+          ding();
+        }
+
+        function setAlertTitle(on) {
+          if (on && !titleFlashTimer) {
+            let flip = false;
+            titleFlashTimer = setInterval(() => {
+              document.title = (flip = !flip) ? '⚠️ APPROVAL NEEDED' : baseTitle;
+            }, 1000);
+          } else if (!on && titleFlashTimer) {
+            clearInterval(titleFlashTimer);
+            titleFlashTimer = null;
+            document.title = baseTitle;
+          }
+        }
+
+        // Browsers gate notification permission and audio behind a user
+        // gesture — grab the first interaction to unlock both.
+        requestNotifyPermission();
+        document.addEventListener('click', () => {
+          requestNotifyPermission();
+          ensureAudio();
+        }, { once: true });
+
+        setInterval(() => { if (currentPending) alertPending(currentPending); }, ALERT_INTERVAL_MS);
+
         // --- State polling ---
         let currentPendingId = null;
+        let currentPending = null;
 
         async function poll() {
           try {
@@ -1170,10 +1416,15 @@ defmodule DbMcp.Web do
             <span class="conn-sep">/</span>
             <div class="conn-field"><span class="conn-label">db:</span><span class="conn-value">${esc(c.database)}</span></div>
             <span class="conn-sep">@</span>
-            <div class="conn-field"><span class="conn-value">${esc(c.host)}:${esc(String.valueOf(c.port))}</span></div>
+            <div class="conn-field"><span class="conn-value">${esc(c.host)}:${esc(String(c.port))}</span></div>
             <span class="conn-sep">as</span>
             <div class="conn-field"><span class="conn-value">${esc(c.user)}</span></div>
           `;
+        }
+
+        function setCtxRow(rowId, valueId, value) {
+          document.getElementById(rowId).style.display = value ? 'flex' : 'none';
+          document.getElementById(valueId).textContent = value || '';
         }
 
         function renderApproval(state) {
@@ -1181,16 +1432,23 @@ defmodule DbMcp.Web do
           if (!state.pending) {
             el.style.display = 'none';
             currentPendingId = null;
+            currentPending = null;
+            setAlertTitle(false);
             return;
           }
           if (currentPendingId === state.pending.id) return;
           currentPendingId = state.pending.id;
+          currentPending = state.pending;
           el.style.display = 'block';
           document.getElementById('approval-conn').textContent = `connection: ${state.pending.connection}`;
-          document.getElementById('approval-desc').textContent = state.pending.description || '';
-          document.getElementById('approval-sql').textContent = state.pending.sql;
+          setCtxRow('approval-desc-row', 'approval-desc', state.pending.description);
+          setCtxRow('approval-reason-row', 'approval-reason', state.pending.reason);
+          setCtxRow('approval-impact-row', 'approval-impact', state.pending.impact);
+          renderSql(document.getElementById('approval-sql'), state.pending.sql);
           document.getElementById('btn-approve').disabled = false;
           document.getElementById('btn-reject').disabled = false;
+          alertPending(state.pending);
+          setAlertTitle(true);
           setTimeout(() => { fitAddon.fit(); sendResize(); }, 50);
         }
 
@@ -1885,12 +2143,15 @@ defmodule DbMcp.Tools do
         "description" =>
           "Submit a write SQL query (INSERT, UPDATE, DELETE, DDL) for approval. " <>
             "This tool BLOCKS until the user approves or rejects the query in the web UI at " <>
-            "http://localhost:#{DbMcp.Server.web_port()}. " <>
+            "http://localhost:#{DbMcp.Server.web_port()} (the browser is opened automatically " <>
+            "and the user is re-alerted every minute while the approval is pending). " <>
+            "Provide honest, specific 'description', 'reason', and 'impact' context — the user " <>
+            "decides based on what you write here. " <>
             "On approval, the query executes immediately and the result is returned. " <>
             "On rejection, the query is NOT executed.",
         "inputSchema" => %{
           "type" => "object",
-          "required" => ["sql"],
+          "required" => ["sql", "description", "reason"],
           "properties" => %{
             "sql" => %{
               "type" => "string",
@@ -1900,7 +2161,19 @@ defmodule DbMcp.Tools do
             "description" => %{
               "type" => "string",
               "description" =>
-                "Brief description of what this query does, shown in the approval UI"
+                "What this query does, in plain language. Shown to the user in the approval UI."
+            },
+            "reason" => %{
+              "type" => "string",
+              "description" =>
+                "Why you are running this query — the task or user request it serves. " <>
+                  "Shown to the user in the approval UI."
+            },
+            "impact" => %{
+              "type" => "string",
+              "description" =>
+                "Expected impact: tables/rows affected, whether the change is reversible, " <>
+                  "and how to undo it if needed. Shown to the user in the approval UI."
             }
           }
         }
@@ -2039,32 +2312,29 @@ defmodule DbMcp.Tools do
   end
 
   def call("pg_submit_write", %{"sql" => sql} = params) do
-    case resolve_connection(params) do
-      {:ok, name} ->
-        description = Map.get(params, "description", "")
+    with {:ok, context} <- write_context(params),
+         {:ok, name} <- resolve_connection(params) do
+      case DbMcp.Approval.submit_and_wait(sql, context, name) do
+        :approve ->
+          case DbMcp.Connection.execute(name, sql) do
+            {:ok, result} ->
+              DbMcp.Activity.push("pg_submit_write", sql, result, :approved, context)
+              tool_result("(Approved)\n\n#{result}")
 
-        case DbMcp.Approval.submit_and_wait(sql, description, name) do
-          :approve ->
-            case DbMcp.Connection.execute(name, sql) do
-              {:ok, result} ->
-                DbMcp.Activity.push("pg_submit_write", sql, result, :approved)
-                tool_result("(Approved)\n\n#{result}")
+            {:error, reason} ->
+              DbMcp.Activity.push("pg_submit_write", sql, reason, :error, context)
+              tool_error("(Approved but failed to execute)\n\n#{reason}")
+          end
 
-              {:error, reason} ->
-                DbMcp.Activity.push("pg_submit_write", sql, reason, :error)
-                tool_error("(Approved but failed to execute)\n\n#{reason}")
-            end
+        :reject ->
+          DbMcp.Activity.push("pg_submit_write", sql, "Rejected", :rejected, context)
+          tool_result("Rejected by user. Query was NOT executed.")
 
-          :reject ->
-            DbMcp.Activity.push("pg_submit_write", sql, "Rejected", :rejected)
-            tool_result("Rejected by user. Query was NOT executed.")
-
-          {:error, reason} ->
-            tool_error(reason)
-        end
-
-      {:error, reason} ->
-        tool_error(reason)
+        {:error, reason} ->
+          tool_error(reason)
+      end
+    else
+      {:error, reason} -> tool_error(reason)
     end
   end
 
@@ -2098,6 +2368,29 @@ defmodule DbMcp.Tools do
 
   def call(tool_name, _params) do
     tool_error("Unknown tool: #{tool_name}")
+  end
+
+  # The human approving a write deserves to know what it does and why the
+  # agent wants it — refuse submissions that skip the context fields.
+  defp write_context(params) do
+    description = params |> Map.get("description", "") |> String.trim()
+    reason = params |> Map.get("reason", "") |> String.trim()
+    impact = params |> Map.get("impact", "") |> String.trim()
+
+    cond do
+      description == "" ->
+        {:error,
+         "Missing 'description': explain in plain language what this query does. " <>
+           "It is shown to the user in the approval UI."}
+
+      reason == "" ->
+        {:error,
+         "Missing 'reason': explain why you are running this query — the task or " <>
+           "user request it serves. It is shown to the user in the approval UI."}
+
+      true ->
+        {:ok, %{description: description, reason: reason, impact: impact}}
+    end
   end
 
   defp resolve_connection(params) do
@@ -2143,7 +2436,7 @@ defmodule DbMcp.Server do
 
   @protocol_version "2025-11-25"
   @server_name "db-mcp"
-  @server_version "0.1.0"
+  @server_version "0.2.0"
 
   def run do
     DbMcp.Log.info("Starting #{@server_name} v#{@server_version}")

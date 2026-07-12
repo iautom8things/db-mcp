@@ -108,6 +108,10 @@ flags = System.argv()
 run_integration = "--integration" in flags
 run_database = "--database" in flags
 
+# Never pop a browser while tests exercise the approval flow. Spawned server
+# ports inherit this environment, so it covers integration tests too.
+System.put_env("DB_MCP_AUTO_OPEN", "0")
+
 # --- Load Server Modules ---
 
 Mix.install([
@@ -785,10 +789,145 @@ approval_results =
 
        DbMcp.Approval.respond(pending.id, :reject)
        TestRunner.assert_eq!(Task.await(task, 1_000), :reject)
+     end},
+    {"context map (description/reason/impact) is carried on the pending approval",
+     fn ->
+       task =
+         Task.async(fn ->
+           DbMcp.Approval.submit_and_wait(
+             "UPDATE t SET value = 3",
+             %{
+               description: "set value to 3",
+               reason: "user asked to bump the value",
+               impact: "1 row; reversible"
+             },
+             "test_conn"
+           )
+         end)
+
+       pending = TestRunner.eventually!(fn -> DbMcp.Approval.get_pending() end)
+
+       TestRunner.assert_eq!(pending.description, "set value to 3")
+       TestRunner.assert_eq!(pending.reason, "user asked to bump the value")
+       TestRunner.assert_eq!(pending.impact, "1 row; reversible")
+
+       DbMcp.Approval.respond(pending.id, :reject)
+       TestRunner.assert_eq!(Task.await(task, 1_000), :reject)
+     end},
+    {"plain-string context is normalized to a description-only map",
+     fn ->
+       task =
+         Task.async(fn ->
+           DbMcp.Approval.submit_and_wait("DELETE FROM t", "legacy description", "test_conn")
+         end)
+
+       pending = TestRunner.eventually!(fn -> DbMcp.Approval.get_pending() end)
+
+       TestRunner.assert_eq!(pending.description, "legacy description")
+       TestRunner.assert_eq!(pending.reason, "")
+       TestRunner.assert_eq!(pending.impact, "")
+
+       DbMcp.Approval.respond(pending.id, :reject)
+       TestRunner.assert_eq!(Task.await(task, 1_000), :reject)
      end}
   ])
 
 results = [approval_results | results]
+
+# --- Write Context Validation Tests ---
+
+write_context_results =
+  TestRunner.run("pg_submit_write context validation", [
+    {"missing description returns instructive error",
+     fn ->
+       result =
+         DbMcp.Tools.call("pg_submit_write", %{
+           "sql" => "DELETE FROM t",
+           "reason" => "cleanup"
+         })
+
+       TestRunner.assert_eq!(result["isError"], true)
+       TestRunner.assert_match!(hd(result["content"])["text"], "Missing 'description'")
+     end},
+    {"missing reason returns instructive error",
+     fn ->
+       result =
+         DbMcp.Tools.call("pg_submit_write", %{
+           "sql" => "DELETE FROM t",
+           "description" => "delete everything"
+         })
+
+       TestRunner.assert_eq!(result["isError"], true)
+       TestRunner.assert_match!(hd(result["content"])["text"], "Missing 'reason'")
+     end},
+    {"whitespace-only context fields are rejected",
+     fn ->
+       result =
+         DbMcp.Tools.call("pg_submit_write", %{
+           "sql" => "DELETE FROM t",
+           "description" => "   ",
+           "reason" => "cleanup"
+         })
+
+       TestRunner.assert_eq!(result["isError"], true)
+       TestRunner.assert_match!(hd(result["content"])["text"], "Missing 'description'")
+     end},
+    {"schema requires sql, description, and reason",
+     fn ->
+       tool = Enum.find(DbMcp.Tools.definitions(), &(&1["name"] == "pg_submit_write"))
+       required = tool["inputSchema"]["required"]
+
+       TestRunner.assert!("sql" in required, "missing required sql")
+       TestRunner.assert!("description" in required, "missing required description")
+       TestRunner.assert!("reason" in required, "missing required reason")
+
+       TestRunner.assert!(
+         get_in(tool, ["inputSchema", "properties", "impact"]),
+         "missing impact property"
+       )
+     end}
+  ])
+
+results = [write_context_results | results]
+
+# --- DbMcp.Browser Tests ---
+
+browser_results =
+  TestRunner.run("DbMcp.Browser", [
+    {"auto_open_enabled? honors DB_MCP_AUTO_OPEN",
+     fn ->
+       original = System.get_env("DB_MCP_AUTO_OPEN")
+
+       try do
+         System.delete_env("DB_MCP_AUTO_OPEN")
+         TestRunner.assert_eq!(DbMcp.Browser.auto_open_enabled?(), true)
+
+         System.put_env("DB_MCP_AUTO_OPEN", "0")
+         TestRunner.assert_eq!(DbMcp.Browser.auto_open_enabled?(), false)
+
+         System.put_env("DB_MCP_AUTO_OPEN", "false")
+         TestRunner.assert_eq!(DbMcp.Browser.auto_open_enabled?(), false)
+
+         System.put_env("DB_MCP_AUTO_OPEN", "1")
+         TestRunner.assert_eq!(DbMcp.Browser.auto_open_enabled?(), true)
+       after
+         TestRunner.restore_env("DB_MCP_AUTO_OPEN", original)
+       end
+     end},
+    {"maybe_open is a no-op when auto-open is disabled",
+     fn ->
+       original = System.get_env("DB_MCP_AUTO_OPEN")
+
+       try do
+         System.put_env("DB_MCP_AUTO_OPEN", "0")
+         TestRunner.assert_eq!(DbMcp.Browser.maybe_open("http://localhost:1"), :ok)
+       after
+         TestRunner.restore_env("DB_MCP_AUTO_OPEN", original)
+       end
+     end}
+  ])
+
+results = [browser_results | results]
 
 # ============================================================
 # LAYER 2: Integration Tests (--integration flag)
@@ -1422,7 +1561,9 @@ results =
                DbMcp.Tools.call("pg_submit_write", %{
                  "connection" => "test",
                  "sql" => "INSERT INTO test_data (name, active) VALUES ('Test Write', true)",
-                 "description" => "test write"
+                 "description" => "test write",
+                 "reason" => "exercising the write approval flow in tests",
+                 "impact" => "adds one row to test_data; reversible via DELETE"
                })
              end)
 

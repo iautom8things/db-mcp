@@ -73,7 +73,7 @@ The server exposes 8 tools over MCP:
 | `pg_disconnect` | Close a connection (or all connections) |
 | `pg_status` | Show connection info (host, database, user, version, pool health) |
 | `pg_query` | Execute a read-only SQL query (table/json/csv output) |
-| `pg_submit_write` | Submit a write query; blocks until the user approves or rejects in the web UI, then executes |
+| `pg_submit_write` | Submit a write query with `description`/`reason`/`impact` context; blocks until the user approves or rejects in the web UI, then executes |
 | `session_history` | Read recent output from the browser psql terminal scrollback |
 | `search_history` | Search the browser psql terminal scrollback for a term |
 
@@ -96,6 +96,7 @@ All are optional; defaults preserve the out-of-the-box behavior.
 | `DB_MCP_OP_BIN`      | Path to the 1Password CLI used by `pg_connect`   | `op` (resolved via `PATH`)                               | `DB_MCP_OP_BIN=/opt/homebrew/bin/op`     |
 | `DB_MCP_OP_ACCOUNT`  | 1Password account passed to `op item get` as `--account`. When unset, `--account` is omitted and `op` uses its currently signed-in account | unset (use `op`'s default account)                       | `DB_MCP_OP_ACCOUNT=my-team`              |
 | `DB_MCP_PYTHON_BIN`  | Path to the `python3` interpreter for the PTY bridge | `System.find_executable("python3")` (resolved via `PATH`) | `DB_MCP_PYTHON_BIN=/Users/me/.venv/bin/python3` |
+| `DB_MCP_AUTO_OPEN`   | Set to `0`/`false`/`no` to stop the server from opening the web UI in a browser while a write approval is blocked waiting on a human | enabled | `DB_MCP_AUTO_OPEN=0`                     |
 
 Set them in your MCP client config (e.g. Claude Code `~/.claude/settings.json`) under the server's `env` block, or export them in the parent shell. An invalid `DB_MCP_WEB_PORT` value (non-integer or out of range) falls back to random allocation with a warning on stderr.
 
@@ -186,8 +187,17 @@ The same URL is also embedded in the responses from `pg_connect`, `pg_connect_lo
 What you see in the browser:
 
 - **Interactive psql terminal** — a real `psql` session running inside a PTY (via `pty_bridge.py`), mirrored over a WebSocket. You can run any SQL here directly; it doesn't go through the approval flow, because the human is already at the keyboard.
-- **Pending write approval banner** — when an MCP client calls `pg_submit_write`, a card appears with the SQL, an optional description, and the connection name. Buttons: **Approve** (runs the query and returns the result to the MCP client) or **Reject** (the query is never executed and the MCP client gets back a rejection message).
+- **Pending write approval banner** — when an MCP client calls `pg_submit_write`, a card appears with the SQL (pretty-printed and syntax-highlighted), the connection name, and the agent's context: **What** the query does, **Why** the agent wants to run it, and its expected **Impact** (rows affected / reversibility). Buttons: **Approve** (runs the query and returns the result to the MCP client) or **Reject** (the query is never executed and the MCP client gets back a rejection message).
 - **Connection status** — host, database, user, port for the currently attached connection.
+- **Agent activity pane** — a running log of `pg_query`/`pg_submit_write` calls with highlighted SQL, the agent's description, and each result.
+
+### Approval alerting
+
+A blocked agent is useless if nobody notices it's blocked, so a pending approval escalates until a human responds:
+
+- **Browser auto-open** — when `pg_submit_write` blocks and no web UI tab is connected, the server opens the UI in your default browser (`open` on macOS, `xdg-open` elsewhere). It re-checks every minute and re-opens if the tab was closed. Disable with `DB_MCP_AUTO_OPEN=0`.
+- **Notification + ding** — an open tab fires a browser notification and an audio ding when the approval appears, and repeats both every minute while it stays unresolved. Clicking the notification focuses the tab. (Browsers require one interaction with the page before notification permission and audio can activate.)
+- **Tab title flash** — the title alternates with `⚠️ APPROVAL NEEDED` so the pending state is visible from a background tab.
 
 ### Why two-step writes?
 
