@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The web UI listened on every network interface, so anyone on the same network could open the `psql` terminal or approve a pending write. Bandit now binds `127.0.0.1` only.
+
 ## [0.2.0] - 2026-07-12
 
 ### Added

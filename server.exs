@@ -2641,6 +2641,7 @@ unless Code.ensure_loaded?(TestRunner) do
   {:ok, _} =
     Bandit.start_link(
       plug: DbMcp.Web,
+      ip: :loopback,
       port: port,
       thousand_island_options: [num_acceptors: 2],
       startup_log: false

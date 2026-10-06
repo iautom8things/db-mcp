@@ -192,6 +192,8 @@ On startup, `server.exs` allocates a random free TCP port (by listening on port 
 
 The same URL is also embedded in the responses from `pg_connect`, `pg_connect_local`, `pg_status`, and `pg_submit_write`, and is exposed in the MCP `initialize` response as `serverInfo.webUi`, so MCP clients can surface it directly to the user.
 
+The server binds `127.0.0.1` only. The page carries an unauthenticated `psql` terminal, so it must never be reachable from the network.
+
 What you see in the browser:
 
 - **Interactive psql terminal** — a real `psql` session running inside a PTY (via `pty_bridge.py`), mirrored over a WebSocket. You can run any SQL here directly; it doesn't go through the approval flow, because the human is already at the keyboard.
